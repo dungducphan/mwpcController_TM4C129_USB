@@ -14,7 +14,7 @@ extern "C"
 // The size of the transmit and receive buffers used. The buffer should be at
 // least twice the size of a maximum-sized USB packet.
 //*****************************************************************************
-#define TX_BULK_BUFFER_SIZE 8192
+#define TX_BULK_BUFFER_SIZE 1
 #define RX_BULK_BUFFER_SIZE 1
 
 extern uint32_t RxHandler(void *pvCBData, uint32_t ui32Event,
