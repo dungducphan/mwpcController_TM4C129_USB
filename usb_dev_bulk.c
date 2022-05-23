@@ -51,8 +51,7 @@
 //*****************************************************************************
 // Definition for ADC sampling frequency (Hz)
 //*****************************************************************************
-//#define ADC_SAMPLING_FREQ 1333333
-#define ADC_SAMPLING_FREQ 1000000
+#define ADC_SAMPLING_FREQ 1333333
 
 //*****************************************************************************
 // Definition for number of analog channels per ADC device
@@ -156,12 +155,11 @@ void PortNIntHandler(void) {
         // is a catch. pui16ADCBuffer is 16-bit while
         // g_pui8USBTxBuffer is 8-bit. Need some code
         // to handle the bit breakup and re-order.
-        // FIXME
-//        uint8_t uiIdx = 0;
-//        for (uiIdx = 0; uiIdx < ADC_SAMPLE_BUF_SIZE; uiIdx++) {
-//            g_pui8USBTxBuffer[5 + 2 * uiIdx + 0] = ((uint16_t)pui16ADCBuffer[uiIdx] >> 0) & 0xFF;
-//            g_pui8USBTxBuffer[5 + 2 * uiIdx + 1] = ((uint16_t)pui16ADCBuffer[uiIdx] >> 8) & 0xFF;
-//        }
+        uint8_t uiIdx = 0;
+        for (uiIdx = 0; uiIdx < ADC_SAMPLE_BUF_SIZE; uiIdx++) {
+            g_pui8USBTxBuffer[5 + 2 * uiIdx + 0] = ((uint16_t)pui16ADCBuffer[uiIdx] >> 0) & 0xFF;
+            g_pui8USBTxBuffer[5 + 2 * uiIdx + 1] = ((uint16_t)pui16ADCBuffer[uiIdx] >> 8) & 0xFF;
+        }
 
         // At this point, data buffer should be already filled
         g_bADCDataOnUSBFIFO = true;
@@ -436,60 +434,67 @@ static uint32_t ProcessHostRequest(tUSBDBulkDevice *psDevice, uint8_t *pi8Data, 
      * buffer.
      */
 
-    UARTprintf("%u\n", g_pui8USBRxBuffer[0]);
+    // Get the current buffer information to allow us to write directly to
+    // the transmit buffer (we already have enough information from the
+    // parameters to access the receive buffer directly).
+    tUSBRingBufObject sTxRing;
+    USBBufferInfoGet(&g_sTxBuffer, &sTxRing);
 
-    g_pui8USBTxBuffer[0] = 136;
-    USBBufferDataWritten(&g_sTxBuffer, 1);
+    // Set up to process the characters by directly accessing the USB buffers.
+    uint_fast32_t ui32ReadIndex = (uint32_t) (pi8Data - g_pui8USBRxBuffer);
+    uint_fast32_t ui32WriteIndex = sTxRing.ui32WriteIndex;
 
+    HOSTREQ_T uiHostReq = (HOSTREQ_T) g_pui8USBRxBuffer[ui32ReadIndex];
+    switch(uiHostReq) {
+        case DATA_AVAILABILITY_QUERY: {
+            if (g_bADCDataOnUSBFIFO) {
+                // Response to DATA_AVAILABILITY_QUERY
+                // Let host know data is available for transfer
+                g_pui8USBTxBuffer[0] = 115;
+                g_pui8USBTxBuffer[1] = 115;
+                g_pui8USBTxBuffer[2] = 115;
+                g_pui8USBTxBuffer[3] = 115;
+                g_pui8USBTxBuffer[4] = 000;
+                USBBufferDataWritten(&g_sTxBuffer, 5);
+                return 5;
+            } else {
+                // Response to DATA_AVAILABILITY_QUERY
+                // Let host know data is not available yet.
+                g_pui8USBTxBuffer[0] = 116;
+                g_pui8USBTxBuffer[1] = 116;
+                g_pui8USBTxBuffer[2] = 116;
+                g_pui8USBTxBuffer[3] = 116;
+                g_pui8USBTxBuffer[4] = 000;
+                USBBufferDataWritten(&g_sTxBuffer, 5);
+                return 5;
+            }
+        }
+        case DATA_TRANSFER_REQUEST: {
+            // Writing token first (let host know that this
+            // is the actual data, not just symbolic response).
+            g_pui8USBTxBuffer[0] = 136;
+            g_pui8USBTxBuffer[1] = 136;
+            g_pui8USBTxBuffer[2] = 136;
+            g_pui8USBTxBuffer[3] = 136;
+            g_pui8USBTxBuffer[4] = 000;
+            // FIXME: in the future, when handle 2 ADC channels
+            // at the same time, need to change this line of
+            // code as well.
+            USBBufferDataWritten(&g_sTxBuffer, 5 + ADC_SAMPLE_BUF_SIZE * 2);
+        }
+        case DATA_RECEIVED_ACKNOWLEDGE: {
+            // Data sent successfully to host.
+            // Ready to put new data on USB FIFO.
+            g_bADCDataOnUSBFIFO = false;
+            break;
+        }
+        default:
+            // Unknown request. Check host code.
+            break;
+    }
 
-//    HOSTREQ_T uiHostReq = (HOSTREQ_T) g_pui8USBRxBuffer[0];
-//    switch(uiHostReq) {
-//        case DATA_AVAILABILITY_QUERY: {
-//            if (g_bADCDataOnUSBFIFO) {
-//                // Response to DATA_AVAILABILITY_QUERY
-//                // Let host know data is available for transfer
-//                g_pui8USBTxBuffer[0] = 115;
-//                g_pui8USBTxBuffer[1] = 115;
-//                g_pui8USBTxBuffer[2] = 115;
-//                g_pui8USBTxBuffer[3] = 115;
-//                g_pui8USBTxBuffer[4] = 000;
-//                USBBufferDataWritten(&g_sTxBuffer, 5);
-//                return 5;
-//            } else {
-//                // Response to DATA_AVAILABILITY_QUERY
-//                // Let host know data is not available yet.
-//                g_pui8USBTxBuffer[0] = 116;
-//                g_pui8USBTxBuffer[1] = 116;
-//                g_pui8USBTxBuffer[2] = 116;
-//                g_pui8USBTxBuffer[3] = 116;
-//                g_pui8USBTxBuffer[4] = 000;
-//                USBBufferDataWritten(&g_sTxBuffer, 5);
-//                return 5;
-//            }
-//        }
-//        case DATA_TRANSFER_REQUEST: {
-//            // Writing token first (let host know that this
-//            // is the actual data, not just symbolic response).
-//            g_pui8USBTxBuffer[0] = 136;
-//            g_pui8USBTxBuffer[1] = 136;
-//            g_pui8USBTxBuffer[2] = 136;
-//            g_pui8USBTxBuffer[3] = 136;
-//            g_pui8USBTxBuffer[4] = 000;
-//            // FIXME: in the future, when handle 2 ADC channels
-//            // at the same time, need to change this line of
-//            // code as well.
-//            USBBufferDataWritten(&g_sTxBuffer, 5 + ADC_SAMPLE_BUF_SIZE * 2);
-//        }
-//        case DATA_RECEIVED_ACKNOWLEDGE: {
-//            // Data sent successfully to host.
-//            // Ready to put new data on USB FIFO.
-//            g_bADCDataOnUSBFIFO = false;
-//            break;
-//        }
-//        default:
-//            // Unknown request. Check host code.
-//            break;
-//    }
+    USBBufferFlush(&g_sTxBuffer);
+    USBBufferFlush(&g_sRxBuffer);
 
     return 0;
 }
@@ -538,8 +543,6 @@ uint32_t RxHandler(void *pvCBData, uint32_t ui32Event, uint32_t ui32MsgValue, vo
             break;
     }
 
-    g_ui32Flags &= ~COMMAND_STATUS_UPDATE;
-
     return 0;
 }
 
@@ -553,6 +556,7 @@ void ConfigureUSB(void) {
     g_bUSBConfigured = false;
 
     // Tell the user what we are up to.
+    MAP_SysCtlDelay(100);
     UARTprintf("Configuring USB... \n");
 
     // Initialize the transmit and receive buffers.
@@ -571,6 +575,7 @@ void ConfigureUSB(void) {
     USBDBulkInit(0, &g_sBulkDevice);
 
     // Wait for initial configuration to complete.
+    MAP_SysCtlDelay(100);
     UARTprintf("Waiting for host...\n");
 }
 
@@ -582,35 +587,23 @@ int main(void) {
     g_bADCDataOnUSBFIFO = false;
 
     ConfigureSystemClock();
-//    ConfigureGPIOPorts();
+    ConfigureGPIOPorts();
     ConfigureUART();
-//    ConfigureUDMA_ADC0();
-//    ConfigureADC0();
-//    ConfigureTimer();
+    ConfigureUDMA_ADC0();
+    ConfigureADC0();
+    ConfigureTimer();
     ConfigureUSB();
 
-//    while (!g_bUSBConfigured) {
-//        MAP_SysCtlDelay(500);
-//        // Have we been asked to update the status display?
-//        if (g_ui32Flags & COMMAND_STATUS_UPDATE) {
-//            g_ui32Flags &= ~COMMAND_STATUS_UPDATE;
-//            if (g_bUSBConfigured) {
-//                UARTprintf("Host Connected. \n");
-//            }
-//        }
-//    }
-
-    while (1) {
-        MAP_SysCtlDelay(500);
+    while (!g_bUSBConfigured) {
+        MAP_SysCtlDelay(100);
         // Have we been asked to update the status display?
         if (g_ui32Flags & COMMAND_STATUS_UPDATE) {
             g_ui32Flags &= ~COMMAND_STATUS_UPDATE;
             if (g_bUSBConfigured) {
-                UARTprintf("Host Connected.            \n\n");
-                UARTprintf("Data transferred:\n");
-            } else {
-                UARTprintf("\n\nHost Disconnected.\n\n");
+                UARTprintf("Host Connected. \n");
             }
         }
     }
+
+    while (1) {}
 }

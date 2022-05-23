@@ -10,6 +10,7 @@
 	<rts value="libc.a"/>
 	<createSlaveProjects value=""/>
 	<filesToOpen value=""/>
-	<origin value="/home/dphan/Downloads/usb_dev_bulk"/>
-	<isTargetManual value="true"/>
+	<origin value="/home/dphan/workspace/ccs-studio/wirechamberController/usb_dev_bulk_git"/>
+	<isTargetManual value="false"/>
+	<connection value="common/targetdb/connections/Stellaris_ICDI_Connection.xml"/>
 </projectOptions>
