@@ -27,42 +27,6 @@
 #include "drivers/pinout.h"
 #include "usb_bulk_structs.h"
 
-//*************************************************************************************************************************************
-//  GLOBAL VARIABLES
-//*************************************************************************************************************************************
-
-//*****************************************************************************
-// Definition for number of ADC samples to perform software-fit (per channel)
-// With TM4C129 without external USB-PHY, the maximum bandwidth is 12Mbps. If
-// TM4C129 ADC is clocked at 1.5MSPS and each sample package data size is 4
-// bytes (12-bit value + metadata), then the maximum number of fit points as
-// a function of LASER shot frequency is as following:
-//
-//          LASER frequency             |      N_fit
-//          ----------------------------|----------------
-//          1kHz                        |      7
-//          2kHz                        |      3
-//          3kHz                        |      2
-//          4kHz                        |      1
-//
-//*****************************************************************************
-#define ADC_SAMPLE_NUM_OF_FITPOINTS 1
-
-//*****************************************************************************
-// Definition for ADC sampling frequency (Hz)
-//*****************************************************************************
-#define ADC_SAMPLING_FREQ 1333333
-
-//*****************************************************************************
-// Definition for number of analog channels per ADC device
-//*****************************************************************************
-#define NUM_OF_CHANNELS 32
-
-//*****************************************************************************
-// Definition for ADC buffer size.
-//*****************************************************************************
-#define ADC_SAMPLE_BUF_SIZE NUM_OF_CHANNELS * ADC_SAMPLE_NUM_OF_FITPOINTS
-
 //*****************************************************************************
 // Global buffers to store ADC sample data.
 //*****************************************************************************
@@ -101,6 +65,35 @@ uint8_t g_ui8SelectBits;
 // Flag of ADC data on USB FIFO
 bool g_bADCDataOnUSBFIFO;
 
+void RAMtoRAM_uDMA(void) {
+    // Copy data from ADC buffer to USB Tx buffer
+    MAP_uDMAChannelTransferSet(UDMA_CHANNEL_SW | UDMA_PRI_SELECT, UDMA_MODE_AUTO, pui16ADCBuffer, g_pui8USBTxBuffer, ADC_SAMPLE_BUF_SIZE * 2);
+
+    // Start transfer
+    MAP_uDMAChannelEnable(UDMA_CHANNEL_SW);
+    MAP_uDMAChannelRequest(UDMA_CHANNEL_SW);
+}
+
+//*****************************************************************************
+// Reset timer after ADC sampling
+//*****************************************************************************
+void ResetTimer(void) {
+    // Disable the timer
+    MAP_TimerDisable(TIMER0_BASE, TIMER_A);
+
+    // Put the pins into a defined initial state (all high)
+    g_ui8SelectBits = 255;
+    MAP_GPIOPinWrite(GPIO_PORTM_BASE,   GPIO_PIN_0 |
+                                        GPIO_PIN_1 |
+                                        GPIO_PIN_2 |
+                                        GPIO_PIN_3 |
+                                        GPIO_PIN_4 |
+                                        GPIO_PIN_5, g_ui8SelectBits);
+
+    // Initiate software-trigger uDMA for ADC-USB buffers here
+    RAMtoRAM_uDMA();
+}
+
 //*****************************************************************************
 // The interrupt handler for PortN2
 //*****************************************************************************
@@ -109,61 +102,26 @@ void PortNIntHandler(void) {
     // Clear Interrupt flag
     MAP_GPIOIntClear(GPIO_PORTN_BASE, GPIO_INT_PIN_2);
 
-    // If PN2 at high-level, start digitizing by starting TIMER and uDMA services.
-    // If PN2 at low-level, disable TIMER, perform other non-ADC services (display with UART, USB/Ethernet to PC, etc).
-    if (MAP_GPIOPinRead(GPIO_PORTN_BASE, GPIO_PIN_2) == 4) {
+    // Set up the transfer parameters for the ADC0-SS3 pri/alt control structure. The mode is set to ping-pong, the transfer source is the ADC Sample
+    // Sequence Result FIFO3 register, and the destination is the receive "A" buffer.  The transfer size is set to match the size of the buffer.
+    // Same for alternative control structure.
+    MAP_uDMAChannelTransferSet(UDMA_CHANNEL_ADC3 | UDMA_PRI_SELECT,
+                               UDMA_MODE_BASIC,
+                               (void*) (ADC0_BASE + ADC_O_SSFIFO3),
+                               &pui16ADCBuffer,
+                               ADC_SAMPLE_BUF_SIZE);
 
-        // This is the time delay between the shot trigger and the actually laser fired
-        // Need to change this based on the specific LASER system setup.
-        // MAP_SysCtlDelay(1);
+    // Enables DMA channel so it can perform transfers.  As soon as the channels are enabled, the peripheral will issue a transfer request and
+    // the data transfers will begin.
+    MAP_uDMAChannelEnable(UDMA_CHANNEL_ADC3);
 
-        // Set up the transfer parameters for the ADC0-SS3 pri/alt control structure. The mode is set to ping-pong, the transfer source is the ADC Sample
-        // Sequence Result FIFO3 register, and the destination is the receive "A" buffer.  The transfer size is set to match the size of the buffer.
-        // Same for alternative control structure.
-        MAP_uDMAChannelTransferSet(UDMA_CHANNEL_ADC3 | UDMA_PRI_SELECT,
-                                   UDMA_MODE_BASIC,
-                                   (void*) (ADC0_BASE + ADC_O_SSFIFO3),
-                                   &pui16ADCBuffer,
-                                   ADC_SAMPLE_BUF_SIZE);
+    // When digitizing, data buffer not fully filled yet
+    g_bADCDataOnUSBFIFO = false;
 
-        // Enables DMA channel so it can perform transfers.  As soon as the channels are enabled, the peripheral will issue a transfer request and
-        // the data transfers will begin.
-        MAP_uDMAChannelEnable(UDMA_CHANNEL_ADC3);
-
-        // When digitizing, data buffer not fully filled yet
-        g_bADCDataOnUSBFIFO = false;
-
-        // Start timer by enabling its
-        g_ui8SelectBits = 0;
-        MAP_TimerLoadSet(TIMER0_BASE, TIMER_A, (g_ui32SysClock / ADC_SAMPLING_FREQ) - 1);
-        MAP_TimerEnable(TIMER0_BASE, TIMER_A);
-    } else {
-        // Disable the timer
-        MAP_TimerDisable(TIMER0_BASE, TIMER_A);
-
-        // Put the pins into a defined initial state (all high)
-        g_ui8SelectBits = 63;
-        MAP_GPIOPinWrite(GPIO_PORTM_BASE,     GPIO_PIN_0 |
-                                              GPIO_PIN_1 |
-                                              GPIO_PIN_2 |
-                                              GPIO_PIN_3 |
-                                              GPIO_PIN_4 |
-                                              GPIO_PIN_5, g_ui8SelectBits);
-
-        // Copy data from pui16ADCBuffer (ADC data buffer)
-        // to g_pui8USBTxBuffer (USB TX buffer). Now there
-        // is a catch. pui16ADCBuffer is 16-bit while
-        // g_pui8USBTxBuffer is 8-bit. Need some code
-        // to handle the bit breakup and re-order.
-        uint8_t uiIdx = 0;
-        for (uiIdx = 0; uiIdx < ADC_SAMPLE_BUF_SIZE; uiIdx++) {
-            g_pui8USBTxBuffer[5 + 2 * uiIdx + 0] = ((uint16_t)pui16ADCBuffer[uiIdx] >> 0) & 0xFF;
-            g_pui8USBTxBuffer[5 + 2 * uiIdx + 1] = ((uint16_t)pui16ADCBuffer[uiIdx] >> 8) & 0xFF;
-        }
-
-        // At this point, data buffer should be already filled
-        g_bADCDataOnUSBFIFO = true;
-    }
+    // Start timer by enabling its
+    g_ui8SelectBits = 0;
+    MAP_TimerLoadSet(TIMER0_BASE, TIMER_A, (g_ui32SysClock / ADC_SAMPLING_FREQ) - 1);
+    MAP_TimerEnable(TIMER0_BASE, TIMER_A);
 }
 
 void ConfigureGPIOPorts(void) {
@@ -181,7 +139,7 @@ void ConfigureGPIOPorts(void) {
                                                GPIO_PIN_5);
 
     // Put the pins into a defined initial state (all high)
-    g_ui8SelectBits = 63;
+    g_ui8SelectBits = 255;
     MAP_GPIOPinWrite(GPIO_PORTM_BASE, GPIO_PIN_0 |
                                       GPIO_PIN_1 |
                                       GPIO_PIN_2 |
@@ -198,7 +156,7 @@ void ConfigureGPIOPorts(void) {
 
     // Enable pin PN2 to mimic LASER shot trigger
     MAP_GPIOPinTypeGPIOInput(GPIO_PORTN_BASE, GPIO_PIN_2);
-    MAP_GPIOIntTypeSet(GPIO_PORTN_BASE, GPIO_PIN_2, GPIO_BOTH_EDGES);
+    MAP_GPIOIntTypeSet(GPIO_PORTN_BASE, GPIO_PIN_2, GPIO_RISING_EDGE);
     MAP_GPIOIntRegister(GPIO_PORTN_BASE, &PortNIntHandler);
     MAP_GPIOIntEnable(GPIO_PORTN_BASE, GPIO_INT_PIN_2);
 }
@@ -215,7 +173,7 @@ void ConfigureUART(void) {
 }
 
 //*************************************************************************************************************************************
-//  Configure uDMA for ADC0 channel
+//  Configure uDMA
 //*************************************************************************************************************************************
 
 //*****************************************************************************
@@ -232,13 +190,13 @@ uint8_t pui8ControlTable[1024];
 uint8_t pui8ControlTable[1024] __attribute__ ((aligned(1024)));
 #endif
 
-//*****************************************************************************
-// The count of uDMA errors.
-// This value is incremented by the uDMA error handler.
-//*****************************************************************************
+// The count of uDMA errors. Incremented by the uDMA error handler.
 static uint32_t g_ui32DMAErrCount = 0u;
 
-void ConfigureUDMA_ADC0(void) {
+//*****************************************************************************
+// uDMA configuration
+//*****************************************************************************
+void ConfigureUDMA(void) {
     MAP_SysCtlPeripheralEnable(SYSCTL_PERIPH_UDMA);
 
     // Enable the uDMA controller.
@@ -256,22 +214,19 @@ void ConfigureUDMA_ADC0(void) {
     MAP_uDMAChannelControlSet(UDMA_CHANNEL_ADC3 | UDMA_PRI_SELECT,
                               UDMA_SIZE_16 | UDMA_SRC_INC_NONE | UDMA_DST_INC_16 | UDMA_ARB_1024);
 
-    // Set up the transfer parameters for the ADC0-SS3 pri/alt control structure. The mode is set to ping-pong, the transfer source is the ADC Sample
-    // Sequence Result FIFO3 register, and the destination is the receive "A" buffer.  The transfer size is set to match the size of the buffer.
-    // Same for alternative control structure.
-    MAP_uDMAChannelTransferSet(UDMA_CHANNEL_ADC3 | UDMA_PRI_SELECT,
-                               UDMA_MODE_BASIC,
-                               (void*) (ADC0_BASE + ADC_O_SSFIFO3),
-                               &pui16ADCBuffer,
-                               ADC_SAMPLE_BUF_SIZE);
-
     // Set the USEBURST attribute for the uDMA ADC0-SS3 channel.  This will force the controller to always use a burst when transferring data from the
     // TX buffer to the UART.  This is somewhat more efficient bus usage than the default which allows single or burst transfers.
     MAP_uDMAChannelAttributeEnable(UDMA_CHANNEL_ADC3, UDMA_ATTR_USEBURST);
 
-    // Enables DMA channel so it can perform transfers.  As soon as the channels are enabled, the peripheral will issue a transfer request and
-    // the data transfers will begin.
-    MAP_uDMAChannelEnable(UDMA_CHANNEL_ADC3);
+    // No attributes must be set for a software-based transfer. The attributes
+    // are cleared by default, but are explicitly cleared here, in case they
+    // were set elsewhere.
+    MAP_uDMAChannelAttributeDisable(UDMA_CHANNEL_SW, UDMA_ATTR_USEBURST | UDMA_ATTR_ALTSELECT | UDMA_ATTR_HIGH_PRIORITY | UDMA_ATTR_REQMASK);
+
+    // Now set up the characteristics of the transfer for 8-bit data size, with
+    // source increments in 1 bytes and destination increments in 1 byte,
+    // and a byte-wise buffer copy. A bus arbitration size of 8 is used.
+    MAP_uDMAChannelControlSet(UDMA_CHANNEL_SW | UDMA_PRI_SELECT, UDMA_SIZE_8 | UDMA_SRC_INC_8 | UDMA_DST_INC_8 | UDMA_ARB_8);
 }
 
 //*****************************************************************************
@@ -374,6 +329,8 @@ void Timer0IntHandler(void) {
                                       GPIO_PIN_4 |
                                       GPIO_PIN_5, g_ui8SelectBits);
     g_ui8SelectBits++;
+
+    if (g_ui8SelectBits >= ADC_SAMPLE_BUF_SIZE * 2) ResetTimer();
 }
 
 //*************************************************************************************************************************************
@@ -391,108 +348,28 @@ static volatile bool g_bUSBConfigured = false;
 //*****************************************************************************
 // Process the data request from host
 //*****************************************************************************
-typedef enum {
-    DATA_AVAILABILITY_QUERY = 114,
-    DATA_TRANSFER_REQUEST = 117,
-    DATA_RECEIVED_ACKNOWLEDGE = 137
-} HOSTREQ_T;
 
 static uint32_t ProcessHostRequest(tUSBDBulkDevice *psDevice, uint8_t *pi8Data, uint_fast32_t ui32NumBytes) {
     /*
-     * How the device-host communication works in this case.
-     * 1. PC is the host. USB bus is controlled by the host
+     * How the device-host communication works:
+     *   1. PC is the host. USB bus is controlled by the host
      * so the host needs to be the one initiate any comms.
-     * 2. Host will start by asking if device has produced
-     * data and put the data on the USB transfer buffer yet
-     * by sending a DATA_AVAILABILITY_QUERY.
-     * 3. Device responses to DATA_AVAILABILITY_QUERY depending
-     * on where or not the data filled the TX buffer. If the
-     * all the data is not there yet, DEV_DATA_UNAVAILABLE is
-     * the response. On the other hand, if all the data are
-     * present in the TX buffer and ready to be sent to host,
-     * the device responses with DEV_DATA_AVAILABLE. The device
-     * actual response will be 4 identical bytes followed by
-     * a terminal byte
-     *     115-115-115-115-000: DEV_DATA_AVAILABLE
-     *     116-116-116-116-000: DEV_DATA_UNAVAILABLE
-     * 4. If the host receives DEV_DATA_UNAVAILABLE as the
-     * response, it will wait for a few hundreds of microseconds
-     * before sending another DATA_AVAILABILITY_QUERY. It will
-     * keep doing this until the response from the device is
-     * DEV_DATA_AVAILABLE.
-     * 5. If the host receives DEV_DATA_AVAILABLE as the
-     * response, it will send a DATA_TRANSFER_REQUEST. The
-     * device will response to this request by start sending
-     * the data. The first 5 bytes indicate to the host that
-     * this package is the ADC sampling data:
-     *     136-136-136-136-000
-     * 6. If host receive the data, it will acknowledge that
-     * by a DATA_RECEIVED_ACKNOWLEDGE. It will then wait for
-     * some long period (~ milliseconds) before sending other
-     * queries and requests. That wait time is enough for the
-     * device to collect new data and put them on the USB
-     * buffer.
+     *   2. Host keeps asking if device has data and wait for
+     * host to response. There is a time out. If within
+     * timeout, host receives no response, host will wait
+     * for some time before asking again.
+     *   3. If device has data, it transmits the data.
      */
 
-    // Get the current buffer information to allow us to write directly to
-    // the transmit buffer (we already have enough information from the
-    // parameters to access the receive buffer directly).
-    tUSBRingBufObject sTxRing;
-    USBBufferInfoGet(&g_sTxBuffer, &sTxRing);
-
-    // Set up to process the characters by directly accessing the USB buffers.
     uint_fast32_t ui32ReadIndex = (uint32_t) (pi8Data - g_pui8USBRxBuffer);
-    uint_fast32_t ui32WriteIndex = sTxRing.ui32WriteIndex;
-
-    HOSTREQ_T uiHostReq = (HOSTREQ_T) g_pui8USBRxBuffer[ui32ReadIndex];
-    switch(uiHostReq) {
-        case DATA_AVAILABILITY_QUERY: {
-            if (g_bADCDataOnUSBFIFO) {
-                // Response to DATA_AVAILABILITY_QUERY
-                // Let host know data is available for transfer
-                g_pui8USBTxBuffer[0] = 115;
-                g_pui8USBTxBuffer[1] = 115;
-                g_pui8USBTxBuffer[2] = 115;
-                g_pui8USBTxBuffer[3] = 115;
-                g_pui8USBTxBuffer[4] = 000;
-                USBBufferDataWritten(&g_sTxBuffer, 5);
-                return 5;
-            } else {
-                // Response to DATA_AVAILABILITY_QUERY
-                // Let host know data is not available yet.
-                g_pui8USBTxBuffer[0] = 116;
-                g_pui8USBTxBuffer[1] = 116;
-                g_pui8USBTxBuffer[2] = 116;
-                g_pui8USBTxBuffer[3] = 116;
-                g_pui8USBTxBuffer[4] = 000;
-                USBBufferDataWritten(&g_sTxBuffer, 5);
-                return 5;
-            }
+    if (g_pui8USBRxBuffer[ui32ReadIndex] == 114) {
+        if (g_bADCDataOnUSBFIFO) {
+            // Send data to host
+            USBBufferDataWritten(&g_sTxBuffer, TX_BULK_BUFFER_SIZE);
         }
-        case DATA_TRANSFER_REQUEST: {
-            // Writing token first (let host know that this
-            // is the actual data, not just symbolic response).
-            g_pui8USBTxBuffer[0] = 136;
-            g_pui8USBTxBuffer[1] = 136;
-            g_pui8USBTxBuffer[2] = 136;
-            g_pui8USBTxBuffer[3] = 136;
-            g_pui8USBTxBuffer[4] = 000;
-            // FIXME: in the future, when handle 2 ADC channels
-            // at the same time, need to change this line of
-            // code as well.
-            USBBufferDataWritten(&g_sTxBuffer, 5 + ADC_SAMPLE_BUF_SIZE * 2);
-        }
-        case DATA_RECEIVED_ACKNOWLEDGE: {
-            // Data sent successfully to host.
-            // Ready to put new data on USB FIFO.
-            g_bADCDataOnUSBFIFO = false;
-            break;
-        }
-        default:
-            // Unknown request. Check host code.
-            break;
     }
 
+    // Flush buffer
     USBBufferFlush(&g_sTxBuffer);
     USBBufferFlush(&g_sRxBuffer);
 
@@ -589,20 +466,21 @@ int main(void) {
     ConfigureSystemClock();
     ConfigureGPIOPorts();
     ConfigureUART();
-    ConfigureUDMA_ADC0();
+    ConfigureUDMA();
     ConfigureADC0();
     ConfigureTimer();
     ConfigureUSB();
 
-    while (!g_bUSBConfigured) {
-        MAP_SysCtlDelay(100);
+    while (1) {
         // Have we been asked to update the status display?
         if (g_ui32Flags & COMMAND_STATUS_UPDATE) {
             g_ui32Flags &= ~COMMAND_STATUS_UPDATE;
             if (g_bUSBConfigured) {
                 UARTprintf("Host Connected. \n");
+                break;
             }
         }
+        MAP_SysCtlDelay(200);
     }
 
     while (1) {}
