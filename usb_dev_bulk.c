@@ -28,9 +28,41 @@
 #include "usb_bulk_structs.h"
 
 //*****************************************************************************
+// Global value for LASER shot number
+//*****************************************************************************
+static uint32_t g_ui32LASERShotID;
+
+//*****************************************************************************
 // Global buffers to store ADC sample data.
 //*****************************************************************************
 static uint16_t pui16ADCBuffer[ADC_SAMPLE_BUF_SIZE];
+
+//*****************************************************************************
+// Global buffers to store ADC-USB conversion buffer.
+//*****************************************************************************
+static uint8_t pui8ADC2USBConversionBuffer[NUM_OF_CHANNELS*2 + 16];
+
+//*****************************************************************************
+// Constant empty buffer
+//*****************************************************************************
+static uint8_t pui8EmptyBuffer[12];
+
+void SetEmptyBuffer(void) {
+    pui8EmptyBuffer[0]  = 1;
+    pui8EmptyBuffer[1]  = 1;
+    pui8EmptyBuffer[2]  = 1;
+    pui8EmptyBuffer[3]  = 1;
+
+    pui8EmptyBuffer[4]  = 0;
+    pui8EmptyBuffer[5]  = 0;
+    pui8EmptyBuffer[6]  = 0;
+    pui8EmptyBuffer[7]  = 0;
+
+    pui8EmptyBuffer[8]  = 1;
+    pui8EmptyBuffer[9]  = 1;
+    pui8EmptyBuffer[10] = 1;
+    pui8EmptyBuffer[11] = 1;
+}
 
 //*****************************************************************************
 // The error routine that is called if the driver library encounters an error.
@@ -63,7 +95,7 @@ void ConfigureSystemClock(void) {
 uint8_t g_ui8SelectBits;
 
 // Flag of ADC data on USB FIFO
-bool g_bADCDataOnUSBFIFO;
+bool g_bADCDataOnConversionBuffer;
 
 void RAMtoRAM_uDMA(void) {
     // Copy data from ADC buffer to USB Tx buffer
@@ -72,6 +104,56 @@ void RAMtoRAM_uDMA(void) {
     // Start transfer
     MAP_uDMAChannelEnable(UDMA_CHANNEL_SW);
     MAP_uDMAChannelRequest(UDMA_CHANNEL_SW);
+}
+
+//*****************************************************************************
+// Software-averaged for ADC buffer
+//*****************************************************************************
+void SoftwareAveragedADC(void) {
+    uint8_t uiChCount = 0;
+    uint8_t uiFitPointCount = 0;
+
+    pui8ADC2USBConversionBuffer[0] = 0;
+    pui8ADC2USBConversionBuffer[1] = 0;
+    pui8ADC2USBConversionBuffer[2] = 0;
+    pui8ADC2USBConversionBuffer[3] = 0;
+
+    pui8ADC2USBConversionBuffer[4] = ((uint32_t)g_ui32LASERShotID >> 0) & 0xFF;
+    pui8ADC2USBConversionBuffer[5] = ((uint32_t)g_ui32LASERShotID >> 8) & 0xFF;
+    pui8ADC2USBConversionBuffer[6] = ((uint32_t)g_ui32LASERShotID >> 16) & 0xFF;
+    pui8ADC2USBConversionBuffer[7] = ((uint32_t)g_ui32LASERShotID >> 24) & 0xFF;
+
+    pui8ADC2USBConversionBuffer[8] = 0;
+    pui8ADC2USBConversionBuffer[9] = 0;
+    pui8ADC2USBConversionBuffer[10] = 0;
+    pui8ADC2USBConversionBuffer[11] = 0;
+
+    for (uiChCount = 0; uiChCount < NUM_OF_CHANNELS; uiChCount++) {
+        for (uiFitPointCount = 0; uiFitPointCount < ADC_SAMPLE_NUM_OF_FITPOINTS; uiFitPointCount++) {
+            pui16ADCBuffer[uiChCount] += pui16ADCBuffer[uiChCount + 32*uiFitPointCount];
+        }
+        pui16ADCBuffer[uiChCount] = pui16ADCBuffer[uiChCount]/ADC_SAMPLE_NUM_OF_FITPOINTS;
+
+        // Conversion from 16-bit to 2 of 8-bit
+        pui8ADC2USBConversionBuffer[12 + 2 * uiChCount + 0] = ((uint16_t)pui16ADCBuffer[uiChCount] >> 0) & 0xFF;
+        pui8ADC2USBConversionBuffer[12 + 2 * uiChCount + 1] = ((uint16_t)pui16ADCBuffer[uiChCount] >> 8) & 0xFF;
+    }
+
+    pui8ADC2USBConversionBuffer[NUM_OF_CHANNELS*2 + 12] = 0;
+    pui8ADC2USBConversionBuffer[NUM_OF_CHANNELS*2 + 13] = 0;
+    pui8ADC2USBConversionBuffer[NUM_OF_CHANNELS*2 + 14] = 0;
+    pui8ADC2USBConversionBuffer[NUM_OF_CHANNELS*2 + 15] = 0;
+
+    g_bADCDataOnConversionBuffer = true;
+}
+
+//*****************************************************************************
+// Restart TIMER
+//*****************************************************************************
+void RestartTimer(void) {
+    g_ui8SelectBits = 0;
+    MAP_TimerLoadSet(TIMER0_BASE, TIMER_A, (g_ui32SysClock / ADC_SAMPLING_FREQ) - 1);
+    MAP_TimerEnable(TIMER0_BASE, TIMER_A);
 }
 
 //*****************************************************************************
@@ -89,9 +171,14 @@ void ResetTimer(void) {
                                         GPIO_PIN_3 |
                                         GPIO_PIN_4 |
                                         GPIO_PIN_5, g_ui8SelectBits);
+    // Software-averaged ADC buffer
+    SoftwareAveragedADC();
 
-    // Initiate software-trigger uDMA for ADC-USB buffers here
-    RAMtoRAM_uDMA();
+/*
+    // For Debug only
+    // Measure the execution time of SoftwareAveragedADC();
+    if (MAP_GPIOPinRead(GPIO_PORTN_BASE, GPIO_PIN_2) == 0x04) RestartTimer();
+*/
 }
 
 //*****************************************************************************
@@ -101,6 +188,9 @@ void ResetTimer(void) {
 void PortNIntHandler(void) {
     // Clear Interrupt flag
     MAP_GPIOIntClear(GPIO_PORTN_BASE, GPIO_INT_PIN_2);
+
+    // Update LASER shot ID
+    g_ui32LASERShotID++;
 
     // Set up the transfer parameters for the ADC0-SS3 pri/alt control structure. The mode is set to ping-pong, the transfer source is the ADC Sample
     // Sequence Result FIFO3 register, and the destination is the receive "A" buffer.  The transfer size is set to match the size of the buffer.
@@ -116,12 +206,10 @@ void PortNIntHandler(void) {
     MAP_uDMAChannelEnable(UDMA_CHANNEL_ADC3);
 
     // When digitizing, data buffer not fully filled yet
-    g_bADCDataOnUSBFIFO = false;
+    g_bADCDataOnConversionBuffer = false;
 
-    // Start timer by enabling its
-    g_ui8SelectBits = 0;
-    MAP_TimerLoadSet(TIMER0_BASE, TIMER_A, (g_ui32SysClock / ADC_SAMPLING_FREQ) - 1);
-    MAP_TimerEnable(TIMER0_BASE, TIMER_A);
+    // Restart timer
+    RestartTimer();
 }
 
 void ConfigureGPIOPorts(void) {
@@ -217,16 +305,6 @@ void ConfigureUDMA(void) {
     // Set the USEBURST attribute for the uDMA ADC0-SS3 channel.  This will force the controller to always use a burst when transferring data from the
     // TX buffer to the UART.  This is somewhat more efficient bus usage than the default which allows single or burst transfers.
     MAP_uDMAChannelAttributeEnable(UDMA_CHANNEL_ADC3, UDMA_ATTR_USEBURST);
-
-    // No attributes must be set for a software-based transfer. The attributes
-    // are cleared by default, but are explicitly cleared here, in case they
-    // were set elsewhere.
-    MAP_uDMAChannelAttributeDisable(UDMA_CHANNEL_SW, UDMA_ATTR_USEBURST | UDMA_ATTR_ALTSELECT | UDMA_ATTR_HIGH_PRIORITY | UDMA_ATTR_REQMASK);
-
-    // Now set up the characteristics of the transfer for 8-bit data size, with
-    // source increments in 1 bytes and destination increments in 1 byte,
-    // and a byte-wise buffer copy. A bus arbitration size of 8 is used.
-    MAP_uDMAChannelControlSet(UDMA_CHANNEL_SW | UDMA_PRI_SELECT, UDMA_SIZE_8 | UDMA_SRC_INC_8 | UDMA_DST_INC_8 | UDMA_ARB_8);
 }
 
 //*****************************************************************************
@@ -361,16 +439,16 @@ static uint32_t ProcessHostRequest(tUSBDBulkDevice *psDevice, uint8_t *pi8Data, 
      *   3. If device has data, it transmits the data.
      */
 
-    uint_fast32_t ui32ReadIndex = (uint32_t) (pi8Data - g_pui8USBRxBuffer);
-    if (g_pui8USBRxBuffer[ui32ReadIndex] == 114) {
-        if (g_bADCDataOnUSBFIFO) {
-            // Send data to host
-            USBBufferDataWritten(&g_sTxBuffer, TX_BULK_BUFFER_SIZE);
+    USBBufferFlush(&g_sTxBuffer);
+
+    if (pi8Data[0] == 114) {
+        if (g_bADCDataOnConversionBuffer) {
+            USBBufferWrite(&g_sTxBuffer, pui8ADC2USBConversionBuffer, TX_BULK_BUFFER_SIZE);
+        } else {
+            USBBufferWrite(&g_sTxBuffer, pui8EmptyBuffer, TX_EMPTY_BUFFER_SIZE);
         }
     }
 
-    // Flush buffer
-    USBBufferFlush(&g_sTxBuffer);
     USBBufferFlush(&g_sRxBuffer);
 
     return 0;
@@ -461,7 +539,10 @@ void ConfigureUSB(void) {
 //*************************************************************************************************************************************
 int main(void) {
     // Initially no data on USB buffer
-    g_bADCDataOnUSBFIFO = false;
+    g_bADCDataOnConversionBuffer = false;
+
+    // Initialize LASER shot ID
+    g_ui32LASERShotID = 0;
 
     ConfigureSystemClock();
     ConfigureGPIOPorts();
@@ -469,16 +550,16 @@ int main(void) {
     ConfigureUDMA();
     ConfigureADC0();
     ConfigureTimer();
+
+    // For USB interface
+    SetEmptyBuffer();
     ConfigureUSB();
 
     while (1) {
         // Have we been asked to update the status display?
-        if (g_ui32Flags & COMMAND_STATUS_UPDATE) {
-            g_ui32Flags &= ~COMMAND_STATUS_UPDATE;
-            if (g_bUSBConfigured) {
-                UARTprintf("Host Connected. \n");
-                break;
-            }
+        if (g_bUSBConfigured) {
+            UARTprintf("Host Connected. \n");
+            break;
         }
         MAP_SysCtlDelay(200);
     }
